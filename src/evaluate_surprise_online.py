@@ -39,6 +39,7 @@ parser.add_argument("--disturbance_start", type=int, default=200,
 parser.add_argument("--disturbance_duration", type=int, default=20,
                     help="Duration of disturbance in steps. At 50Hz, 20 steps = 0.4s")
 parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+parser.add_argument("--flat_terrain", action="store_true", help="Override terrain to flat (for rough policy on flat ground).")
 parser.add_argument("--plot", action="store_true", help="Plot surprise over time.")
 parser.add_argument("--video", action="store_true", help="Record video of the evaluation.")
 parser.add_argument("--video_resolution", type=int, nargs=2, default=[1920, 1080], 
@@ -212,6 +213,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlBaseRun
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.seed = args_cli.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    
+    # Override terrain to flat if requested (keeps observations the same)
+    if args_cli.flat_terrain:
+        print("[INFO]: Overriding terrain to flat ground")
+        env_cfg.scene.terrain.terrain_type = "plane"
+        env_cfg.scene.terrain.terrain_generator = None
+        # Disable terrain curriculum
+        if hasattr(env_cfg, 'curriculum') and hasattr(env_cfg.curriculum, 'terrain_levels'):
+            env_cfg.curriculum.terrain_levels = None
     
     # set video resolution if recording
     if args_cli.video:

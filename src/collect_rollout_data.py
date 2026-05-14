@@ -108,12 +108,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlBaseRun
     print(f"[INFO]: Observation dim: {obs_dim}, Action dim: {action_dim}, Num envs: {num_envs}")
 
     # allocate storage for data collection
-    # we collect: o_t, a_t, o_{t+1}
+    # we collect: o_t, a_t, o_{t+1}, done, episode_step (for phase labeling)
     total_transitions = args_cli.num_steps * num_envs
     obs_data = torch.zeros((total_transitions, obs_dim), dtype=torch.float32, device="cpu")
     action_data = torch.zeros((total_transitions, action_dim), dtype=torch.float32, device="cpu")
     next_obs_data = torch.zeros((total_transitions, obs_dim), dtype=torch.float32, device="cpu")
     done_data = torch.zeros((total_transitions,), dtype=torch.bool, device="cpu")
+    episode_step_data = torch.zeros((total_transitions,), dtype=torch.int32, device="cpu")  # track step within episode
+
+    # track episode step for each env (reset to 0 on done)
+    episode_steps = torch.zeros(num_envs, dtype=torch.int32, device="cpu")
 
     # reset environment
     obs = env.get_observations()
@@ -133,6 +137,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlBaseRun
 
             obs_data[start_idx:end_idx] = obs_policy.cpu()
             action_data[start_idx:end_idx] = actions.cpu()
+            episode_step_data[start_idx:end_idx] = episode_steps.clone()
 
             # step environment
             obs, _, dones, _ = env.step(actions)
@@ -141,6 +146,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlBaseRun
             # store next observation and done flags
             next_obs_data[start_idx:end_idx] = obs_policy.cpu()
             done_data[start_idx:end_idx] = dones.bool().cpu()
+
+            # update episode step counters using torch.where for reliable reset
+            dones_cpu = dones.bool().cpu()
+            episode_steps = torch.where(
+                dones_cpu,
+                torch.zeros_like(episode_steps),
+                episode_steps + 1
+            )
 
             # reset recurrent states for episodes that have terminated
             policy_nn.reset(dones)
@@ -159,10 +172,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlBaseRun
         actions=action_data.numpy(),
         next_obs=next_obs_data.numpy(),
         dones=done_data.numpy(),
+        episode_steps=episode_step_data.numpy(),  # step within episode for phase labeling
         obs_dim=obs_dim,
         action_dim=action_dim,
         num_envs=num_envs,
         num_steps=args_cli.num_steps,
+        task=args_cli.task,
     )
 
     # compute and save normalization statistics (excluding transitions after reset)
@@ -170,6 +185,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlBaseRun
     obs_valid = obs_data.numpy()[valid_mask]
     action_valid = action_data.numpy()[valid_mask]
     next_obs_valid = next_obs_data.numpy()[valid_mask]
+    episode_steps_np = episode_step_data.numpy()
+
+    # Analyze phase distribution
+    standup_mask = episode_steps_np < 50  # first 50 steps = standup phase
+    walking_mask = episode_steps_np >= 50  # step 50+ = walking phase
+    print(f"[INFO]: Phase distribution:")
+    print(f"  Standup phase (steps 0-49): {standup_mask.sum()} transitions ({100*standup_mask.sum()/len(episode_steps_np):.1f}%)")
+    print(f"  Walking phase (steps 50+): {walking_mask.sum()} transitions ({100*walking_mask.sum()/len(episode_steps_np):.1f}%)")
 
     stats = {
         "obs_mean": obs_valid.mean(axis=0),

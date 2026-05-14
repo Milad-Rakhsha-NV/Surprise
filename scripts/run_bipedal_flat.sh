@@ -18,7 +18,10 @@ export PATH="/home/horde/miniforge3/envs/IsaacLab/bin:$PATH"
 
 # Model paths - these are the trained artifacts
 CHECKPOINT="${CHECKPOINT:-$HOME/repos/unitree_rl_lab/logs/rsl_rl/unitree_go2_bipedal_walk_rough/0_best/best.pt}"
-FORWARD_MODEL="${FORWARD_MODEL:-$HOME/repos/unitree_rl_lab/logs/rsl_rl/unitree_go2_bipedal_walk_rough/0_best/rollout_data_mixed/forward_model_flat_only/forward_model_best.pt}"
+# Forward model from repo (or override with env var)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+FORWARD_MODEL="${FORWARD_MODEL:-$REPO_ROOT/models/bipedal_go2_flat/forward_model_best.pt}"
 OUTPUT_DIR="${OUTPUT_DIR:-$HOME/repos/unitree_rl_lab/logs/rsl_rl/unitree_go2_bipedal_walk_rough/0_best/surprise_evaluation_flat}"
 
 # Flat terrain task (uses Newton backend)

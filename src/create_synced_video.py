@@ -96,31 +96,34 @@ def create_synced_video(
     fig, axes = plt.subplots(2, 1, figsize=(fig_width, fig_height), dpi=dpi)
     fig.patch.set_facecolor('white')
     
-    # Top plot: Surprise
+    # Top plot: Prediction Error (MSE) - main metric
     ax1 = axes[0]
-    ax1.fill_between(timestamps, mean_surprise - std_surprise, mean_surprise + std_surprise,
-                     alpha=0.3, color='blue', label='Std across envs')
-    ax1.plot(timestamps, mean_surprise, 'b-', linewidth=1.5, label='Mean surprise')
+    std_error = prediction_error.std(axis=1)
+    ax1.fill_between(timestamps, mean_error - std_error, mean_error + std_error,
+                     alpha=0.3, color='green', label='Std across envs')
+    ax1.plot(timestamps, mean_error, 'g-', linewidth=1.5, label='Mean prediction error')
     
     # Add disturbance window
     if dist_start_time > 0:
         ax1.axvspan(dist_start_time, dist_end_time, alpha=0.3, color='red', label='Disturbance')
         ax1.axvline(x=dist_start_time, color='red', linestyle='--', linewidth=2)
     
-    ax1.set_ylabel('Surprise (NLL sum)', fontsize=11)
-    ax1.set_title(f'Online Surprise with Time Marker ({num_envs} envs)', fontsize=12, fontweight='bold')
+    ax1.set_ylabel('Prediction Error (MSE)', fontsize=11)
+    ax1.set_title(f'Forward Model Prediction Error ({num_envs} envs)', fontsize=12, fontweight='bold')
     ax1.legend(loc='upper right', fontsize=9)
     ax1.grid(True, alpha=0.3)
     ax1.set_xlim(0, timestamps[-1])
     
-    # Bottom plot: MSE
+    # Bottom plot: Surprise (NLL)
     ax2 = axes[1]
-    ax2.plot(timestamps, mean_error, 'g-', linewidth=1.5)
+    ax2.fill_between(timestamps, mean_surprise - std_surprise, mean_surprise + std_surprise,
+                     alpha=0.3, color='blue')
+    ax2.plot(timestamps, mean_surprise, 'b-', linewidth=1.5)
     if dist_start_time > 0:
         ax2.axvspan(dist_start_time, dist_end_time, alpha=0.3, color='red')
         ax2.axvline(x=dist_start_time, color='red', linestyle='--', linewidth=2)
     ax2.set_xlabel('Time (seconds)', fontsize=11)
-    ax2.set_ylabel('Prediction Error (MSE)', fontsize=11)
+    ax2.set_ylabel('Surprise (NLL)', fontsize=11)
     ax2.grid(True, alpha=0.3)
     ax2.set_xlim(0, timestamps[-1])
     
@@ -202,9 +205,9 @@ def create_synced_video(
         data_idx = np.searchsorted(timestamps, current_time)
         data_idx = min(data_idx, num_steps - 1)
         
-        # Update markers
-        marker1.set_data([current_time], [mean_surprise[data_idx]])
-        marker2.set_data([current_time], [mean_error[data_idx]])
+        # Update markers - top is prediction error, bottom is surprise
+        marker1.set_data([current_time], [mean_error[data_idx]])
+        marker2.set_data([current_time], [mean_surprise[data_idx]])
         vline1.set_xdata([current_time, current_time])
         vline2.set_xdata([current_time, current_time])
         
@@ -222,8 +225,8 @@ def create_synced_video(
             status_text.set_text('NOMINAL')
             status_text.set_bbox(dict(boxstyle='round', facecolor='lightgreen', alpha=0.9))
         
-        # Update surprise value display
-        surprise_text.set_text(f'Surprise: {mean_surprise[data_idx]:.1f}')
+        # Update surprise value display - now shows prediction error
+        surprise_text.set_text(f'Pred Error: {mean_error[data_idx]:.3f}')
         
         # Render graph
         graph_frame = fig_to_array(fig)

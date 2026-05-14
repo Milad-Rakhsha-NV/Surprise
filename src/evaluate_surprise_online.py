@@ -46,6 +46,8 @@ parser.add_argument("--video_resolution", type=int, nargs=2, default=[1920, 1080
                     metavar=('WIDTH', 'HEIGHT'), help="Video resolution (default: 1920 1080).")
 parser.add_argument("--real_time", action="store_true", help="Run at real-time speed for visualization.")
 parser.add_argument("--output_dir", type=str, default=None, help="Directory to save results.")
+parser.add_argument("--ignore_warmup_steps", type=int, default=0,
+                    help="Number of initial steps per episode to ignore in surprise computation (e.g., 50 for bipedal standup).")
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -78,6 +80,14 @@ from isaaclab.utils.dict import print_dict
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 
 import isaaclab_tasks  # noqa: F401
+
+# Import unitree_rl_lab tasks (must be after SimulationApp)
+try:
+    from unitree_rl_lab.tasks.locomotion.robots import go2  # noqa: F401
+    print("[INFO]: Loaded unitree_rl_lab.tasks.locomotion.robots.go2")
+except ImportError as e:
+    print(f"[WARNING]: Could not import unitree_rl_lab tasks: {e}")
+
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 
@@ -156,14 +166,23 @@ class SurpriseEstimator:
         action_n = self.normalize_action(action)
         next_obs_n = self.normalize_obs(next_obs)
         
+        # Clip normalized values to avoid extreme outliers affecting predictions
+        obs_n = obs_n.clamp(-10, 10)
+        action_n = action_n.clamp(-10, 10)
+        next_obs_n_clipped = next_obs_n.clamp(-10, 10)
+        
         pred_mean, pred_logvar = self.model(obs_n, action_n)
         var = pred_logvar.exp()
         
         # per-sample surprise (summed over dimensions) - shape: (num_envs,)
-        surprise = 0.5 * (pred_logvar + (next_obs_n - pred_mean).pow(2) / var).sum(dim=-1)
+        surprise = 0.5 * (pred_logvar + (next_obs_n_clipped - pred_mean).pow(2) / var).sum(dim=-1)
         
-        # prediction error per environment
-        pred_error = (next_obs_n - pred_mean).pow(2).mean(dim=-1)
+        # prediction error per environment (normalized space, clipped)
+        pred_error = (next_obs_n_clipped - pred_mean).pow(2).mean(dim=-1)
+        
+        # unnormalized prediction error (for interpretability)
+        pred_unnorm = pred_mean * self.obs_std + self.obs_mean
+        pred_error_raw = (next_obs - pred_unnorm).pow(2).mean(dim=-1)
         
         # update EMA per environment
         if self.surprise_ema is None:
@@ -175,6 +194,7 @@ class SurpriseEstimator:
             "surprise": surprise,
             "surprise_ema": self.surprise_ema.clone(),
             "pred_error": pred_error,
+            "pred_error_raw": pred_error_raw,
         }
     
     def reset(self, env_ids: torch.Tensor | None = None):
@@ -202,9 +222,73 @@ def apply_push_velocity(robot, velocity: torch.Tensor):
         robot: The robot articulation
         velocity: Velocity to add (num_envs, 6) - [lin_vel (3), ang_vel (3)]
     """
-    current_vel = robot.data.root_vel_w.clone()
+    # Handle both torch tensors and Newton ProxyArrays
+    current_vel = robot.data.root_vel_w
+    if hasattr(current_vel, 'clone'):
+        current_vel = current_vel.clone()
+    else:
+        # Newton ProxyArray - convert to tensor
+        current_vel = torch.as_tensor(current_vel, device=velocity.device)
     new_vel = current_vel + velocity
-    robot.write_root_velocity_to_sim(new_vel)
+    # Use the new index-based API for Newton compatibility
+    robot.write_root_velocity_to_sim_index(root_velocity=new_vel)
+
+
+def load_policy_from_checkpoint(checkpoint_path: str, obs_dim: int, action_dim: int, device: str):
+    """Load policy directly from checkpoint, bypassing RSL-RL runner config issues.
+    
+    This is a fallback for when the agent config doesn't match the current RSL-RL version.
+    """
+    from rsl_rl.modules import MLP, GaussianDistribution
+    
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    
+    # Check checkpoint format
+    if "actor_state_dict" in checkpoint:
+        actor_state = checkpoint["actor_state_dict"]
+        
+        # Infer architecture from weights
+        # Look for mlp weights: mlp.0.weight, mlp.2.weight, etc.
+        hidden_dims = []
+        layer_idx = 0
+        while f"mlp.{layer_idx * 2}.weight" in actor_state:
+            w = actor_state[f"mlp.{layer_idx * 2}.weight"]
+            if layer_idx == 0:
+                input_dim = w.shape[1]
+            hidden_dims.append(w.shape[0])
+            layer_idx += 1
+        
+        # Last hidden dim is actually the output (action) dim
+        output_dim = hidden_dims.pop()
+        
+        print(f"[INFO]: Inferred actor architecture: {input_dim} -> {hidden_dims} -> {output_dim}")
+        
+        # Build MLP actor
+        mlp = MLP(input_dim, output_dim, hidden_dims, activation="elu").to(device)
+        
+        # Load MLP weights (need to strip 'mlp.' prefix)
+        mlp_state = {k.replace('mlp.', ''): v for k, v in actor_state.items() if k.startswith("mlp.")}
+        mlp.load_state_dict(mlp_state)
+        
+        # Get std params for distribution
+        if "distribution.std_param" in actor_state:
+            std_param = actor_state["distribution.std_param"].to(device)
+        else:
+            std_param = torch.zeros(output_dim, device=device)
+        
+        mlp.eval()
+        
+        # Add a dummy reset method that MLP doesn't have
+        mlp.reset = lambda x=None: None
+        
+        def inference_policy(obs_dict):
+            """Wrapper to match the expected interface."""
+            obs = obs_dict["policy"]
+            return mlp(obs)
+        
+        return inference_policy, mlp
+    else:
+        raise ValueError(f"Unknown checkpoint format. Keys: {list(checkpoint.keys())}")
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
@@ -291,14 +375,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlBaseRun
     # load policy
     resume_path = retrieve_file_path(args_cli.checkpoint)
     print(f"[INFO]: Loading policy from: {resume_path}")
-    runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    runner.load(resume_path)
-    policy = runner.get_inference_policy(device=device)
     
+    # Try standard RSL-RL loading first, fallback to direct loading if config mismatch
     try:
-        policy_nn = runner.alg.policy
-    except AttributeError:
-        policy_nn = runner.alg.actor_critic
+        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        runner.load(resume_path)
+        policy = runner.get_inference_policy(device=device)
+        
+        try:
+            policy_nn = runner.alg.policy
+        except AttributeError:
+            policy_nn = runner.alg.actor_critic
+        print("[INFO]: Policy loaded via OnPolicyRunner")
+    except (KeyError, TypeError, ValueError) as e:
+        print(f"[WARNING]: OnPolicyRunner failed ({e}), loading policy directly from checkpoint")
+        obs_dim = env.observation_space["policy"].shape[0]
+        action_dim = env.action_space.shape[0]
+        policy, policy_nn = load_policy_from_checkpoint(resume_path, obs_dim, action_dim, device)
 
     # load forward model
     print(f"[INFO]: Loading forward model from: {args_cli.forward_model}")
@@ -311,7 +404,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlBaseRun
     surprise_history = []  # (num_steps, num_envs)
     surprise_ema_history = []
     pred_error_history = []
+    pred_error_raw_history = []
     disturbance_active_history = []
+    episode_step_history = []  # track episode step for warmup filtering
+
+    # track episode step per environment (for warmup filtering)
+    episode_steps = torch.zeros(num_envs, dtype=torch.int32, device=device)
 
     # run evaluation
     obs = env.get_observations()
@@ -319,6 +417,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlBaseRun
     print(f"[INFO]: Running evaluation for {args_cli.num_steps} steps with {num_envs} environments")
     print(f"[INFO]: Disturbance type: {args_cli.disturbance_type}")
     print(f"[INFO]: Disturbance window: steps {args_cli.disturbance_start} to {disturbance_end}")
+    if args_cli.ignore_warmup_steps > 0:
+        print(f"[INFO]: Ignoring first {args_cli.ignore_warmup_steps} steps per episode (warmup/standup)")
     if args_cli.disturbance_type == "external_force":
         print(f"[INFO]: Force magnitude: {args_cli.force_magnitude} N")
     elif args_cli.disturbance_type == "external_torque":
@@ -386,13 +486,30 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlBaseRun
             surprise_history.append(surprise_result["surprise"].cpu().numpy())
             surprise_ema_history.append(surprise_result["surprise_ema"].cpu().numpy())
             pred_error_history.append(surprise_result["pred_error"].cpu().numpy())
+            pred_error_raw_history.append(surprise_result["pred_error_raw"].cpu().numpy())
             disturbance_active_history.append(1.0 if disturbance_is_active else 0.0)
+            episode_step_history.append(episode_steps.cpu().numpy().copy())
+            
+            # DEBUG: Log observation statistics at specific steps
+            if step == 100:  # During normal walking
+                obs_np = obs_policy.cpu().numpy()
+                print(f"\n[DEBUG] Step {step} observation stats:")
+                print(f"  Mean: {obs_np.mean():.4f}, Std: {obs_np.std():.4f}")
+                print(f"  Min: {obs_np.min():.4f}, Max: {obs_np.max():.4f}")
+                print(f"  Per-dim mean range: [{obs_np.mean(axis=0).min():.4f}, {obs_np.mean(axis=0).max():.4f}]")
+                print(f"  Dim 25 value: {obs_np[:, 25].mean():.6f}")
+            
+            # update episode step counters
+            episode_steps = episode_steps + 1
             
             # reset surprise EMA for terminated environments
-            if dones.any():
-                surprise_estimator.reset(dones.nonzero().squeeze(-1))
+            dones_bool = dones.bool() if hasattr(dones, 'bool') else dones
+            if dones_bool.any():
+                surprise_estimator.reset(dones_bool.nonzero().squeeze(-1))
+                # reset episode steps for terminated envs
+                episode_steps[dones_bool] = 0
             
-            policy_nn.reset(dones)
+            policy_nn.reset(dones_bool)
             obs = obs_next
 
         # real-time delay for visualization
@@ -413,10 +530,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlBaseRun
     surprise_ema_history = np.stack(surprise_ema_history)
     pred_error_history = np.stack(pred_error_history)
     disturbance_active_history = np.array(disturbance_active_history)
+    episode_step_history = np.stack(episode_step_history)  # (num_steps, num_envs)
 
-    # compute mean across environments for summary
-    surprise_mean = surprise_history.mean(axis=1)
-    surprise_std = surprise_history.std(axis=1)
+    # create warmup mask (True = past warmup phase)
+    warmup_mask = episode_step_history >= args_cli.ignore_warmup_steps  # (num_steps, num_envs)
+    
+    # compute mean across environments for summary (excluding warmup)
+    if args_cli.ignore_warmup_steps > 0:
+        # mask warmup values with NaN, then use nanmean
+        surprise_masked = np.where(warmup_mask, surprise_history, np.nan)
+        surprise_mean = np.nanmean(surprise_masked, axis=1)
+        surprise_std = np.nanstd(surprise_masked, axis=1)
+        # replace any remaining NaN (all envs in warmup) with 0
+        surprise_mean = np.nan_to_num(surprise_mean, nan=0.0)
+        surprise_std = np.nan_to_num(surprise_std, nan=0.0)
+    else:
+        surprise_mean = surprise_history.mean(axis=1)
+        surprise_std = surprise_history.std(axis=1)
     
     # save results
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -427,6 +557,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlBaseRun
         "surprise_mean": surprise_mean,
         "surprise_std": surprise_std,
         "disturbance_active": disturbance_active_history,
+        "episode_steps": episode_step_history,
+        "warmup_mask": warmup_mask,
+        "ignore_warmup_steps": args_cli.ignore_warmup_steps,
         "disturbance_type": args_cli.disturbance_type,
         "force_magnitude": args_cli.force_magnitude,
         "torque_magnitude": args_cli.torque_magnitude,

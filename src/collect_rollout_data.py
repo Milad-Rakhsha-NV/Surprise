@@ -49,10 +49,60 @@ from rsl_rl.runners import OnPolicyRunner
 from isaaclab.envs import DirectMARLEnv, DirectRLEnvCfg, ManagerBasedRLEnvCfg, multi_agent_to_single_agent
 from isaaclab.utils.assets import retrieve_file_path
 
+
+class LegacyPolicyWrapper:
+    """Wrapper to load legacy RSL-RL checkpoints that lack class_name in config."""
+    
+    def __init__(self, checkpoint_path: str, obs_dim: int, action_dim: int, device: str = "cuda:0"):
+        import torch.nn as nn
+        
+        # Legacy architecture: 135 -> 512 -> 256 -> 128 -> 12
+        self.actor = nn.Sequential(
+            nn.Linear(obs_dim, 512),
+            nn.ELU(),
+            nn.Linear(512, 256),
+            nn.ELU(), 
+            nn.Linear(256, 128),
+            nn.ELU(),
+            nn.Linear(128, action_dim)
+        ).to(device)
+        
+        # Load weights from checkpoint
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        actor_state = ckpt.get('actor_state_dict', {})
+        
+        # Map legacy keys (mlp.X) to our sequential model (X)
+        new_state = {}
+        key_mapping = [
+            ('mlp.0.weight', '0.weight'), ('mlp.0.bias', '0.bias'),
+            ('mlp.2.weight', '2.weight'), ('mlp.2.bias', '2.bias'),
+            ('mlp.4.weight', '4.weight'), ('mlp.4.bias', '4.bias'),
+            ('mlp.6.weight', '6.weight'), ('mlp.6.bias', '6.bias'),
+        ]
+        for old_key, new_key in key_mapping:
+            if old_key in actor_state:
+                new_state[new_key] = actor_state[old_key]
+        
+        self.actor.load_state_dict(new_state)
+        self.actor.eval()
+        self.device = device
+        
+    def __call__(self, obs_dict):
+        obs = obs_dict["policy"] if isinstance(obs_dict, dict) else obs_dict
+        with torch.inference_mode():
+            return self.actor(obs)
+
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils.hydra import hydra_task_config
+
+# Import unitree_rl_lab tasks to register them
+try:
+    from unitree_rl_lab.tasks.locomotion.robots import go2  # noqa: F401
+    print("[INFO]: Loaded unitree_rl_lab.tasks.locomotion.robots.go2")
+except ImportError as e:
+    print(f"[WARNING]: Could not import unitree_rl_lab tasks: {e}")
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
@@ -88,17 +138,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlBaseRun
     resume_path = retrieve_file_path(args_cli.checkpoint)
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
 
-    runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    runner.load(resume_path)
-
-    # obtain the trained policy for inference
-    policy = runner.get_inference_policy(device=env.unwrapped.device)
-
-    # extract the neural network module
+    # Try standard RSL-RL loading, fall back to legacy wrapper
     try:
-        policy_nn = runner.alg.policy
-    except AttributeError:
-        policy_nn = runner.alg.actor_critic
+        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        runner.load(resume_path)
+        policy = runner.get_inference_policy(device=env.unwrapped.device)
+        print("[INFO]: Loaded policy using standard RSL-RL runner")
+    except (KeyError, RuntimeError) as e:
+        print(f"[WARNING]: Standard loading failed ({e}), trying legacy wrapper...")
+        obs_dim = env.observation_space["policy"].shape[-1]
+        action_dim = env.num_actions
+        policy = LegacyPolicyWrapper(resume_path, obs_dim, action_dim, device=str(env.unwrapped.device))
+        print("[INFO]: Loaded policy using legacy wrapper")
 
     # get observation and action dimensions
     obs_dim = env.observation_space["policy"].shape[-1]
@@ -129,7 +180,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlBaseRun
     for step in range(args_cli.num_steps):
         with torch.inference_mode():
             # get action from policy
-            actions = policy(obs)
+            actions = policy(obs_policy)
 
             # store current observation and action
             start_idx = idx
@@ -156,7 +207,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlBaseRun
             )
 
             # reset recurrent states for episodes that have terminated
-            policy_nn.reset(dones)
+            # (legacy wrapper doesn't have recurrent states, only needed for standard policy)
+            if hasattr(policy, 'reset'):
+                policy.reset(dones)
 
             idx += num_envs
 

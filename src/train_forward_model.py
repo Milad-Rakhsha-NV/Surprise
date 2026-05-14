@@ -75,9 +75,18 @@ class TransitionDataset(Dataset):
     """Dataset for (o_t, a_t, o_{t+1}) transitions."""
 
     def __init__(self, obs: np.ndarray, actions: np.ndarray, next_obs: np.ndarray, 
-                 dones: np.ndarray, normalize: bool = True, stats: dict | None = None):
+                 dones: np.ndarray, normalize: bool = True, stats: dict | None = None,
+                 episode_steps: np.ndarray | None = None, min_episode_step: int = 0):
         # filter out transitions that end with a reset (next_obs is from new episode)
         valid_mask = ~dones
+        
+        # filter out warmup/standup phase if requested
+        if episode_steps is not None and min_episode_step > 0:
+            warmup_mask = episode_steps >= min_episode_step
+            valid_mask = valid_mask & warmup_mask
+            print(f"[INFO]: Filtering to episode steps >= {min_episode_step}: "
+                  f"{valid_mask.sum():,} / {len(dones):,} samples ({100*valid_mask.mean():.1f}%)")
+        
         self.obs = torch.from_numpy(obs[valid_mask]).float()
         self.actions = torch.from_numpy(actions[valid_mask]).float()
         self.next_obs = torch.from_numpy(next_obs[valid_mask]).float()
@@ -87,9 +96,21 @@ class TransitionDataset(Dataset):
         if normalize:
             if stats is None:
                 self.obs_mean = self.obs.mean(dim=0)
-                self.obs_std = self.obs.std(dim=0) + 1e-6
+                # Use robust normalization: clip std to avoid explosion from outliers
+                # Also use percentile-based std for robustness
+                obs_std_raw = self.obs.std(dim=0)
+                # Clip extreme values: cap at 10 std from mean
+                self.obs_std = obs_std_raw.clamp(min=0.01)
+                
                 self.action_mean = self.actions.mean(dim=0)
-                self.action_std = self.actions.std(dim=0) + 1e-6
+                self.action_std = self.actions.std(dim=0).clamp(min=0.01)
+                
+                # Report constant dimensions
+                const_dims = (obs_std_raw < 0.001).nonzero().squeeze().tolist()
+                if const_dims:
+                    if isinstance(const_dims, int):
+                        const_dims = [const_dims]
+                    print(f"[INFO]: Constant observation dimensions (std < 0.001): {const_dims}")
             else:
                 self.obs_mean = torch.from_numpy(stats["obs_mean"]).float()
                 self.obs_std = torch.from_numpy(stats["obs_std"]).float()
@@ -368,6 +389,7 @@ def train_forward_model(
     device: str = "cuda",
     seed: int = 42,
     early_stopping_patience: int = 20,
+    min_episode_step: int = 0,
 ):
     """Train the forward model with full validation and testing.
     
@@ -383,6 +405,7 @@ def train_forward_model(
         device: Device to train on
         seed: Random seed
         early_stopping_patience: Stop if no improvement for this many epochs
+        min_episode_step: Minimum episode step to include in training (for filtering warmup/standup)
     """
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -401,27 +424,34 @@ def train_forward_model(
     actions = data["actions"]
     next_obs = data["next_obs"]
     dones = data["dones"]
+    episode_steps = data["episode_steps"] if "episode_steps" in data else None
     obs_dim = int(data["obs_dim"])
     action_dim = int(data["action_dim"])
 
     print(f"      obs_dim={obs_dim}, action_dim={action_dim}")
     print(f"      Total samples: {len(obs):,}")
     print(f"      Valid transitions: {(~dones).sum():,} ({100*(~dones).mean():.1f}%)")
+    if min_episode_step > 0:
+        print(f"      Filtering warmup: min_episode_step={min_episode_step}")
 
-    # load normalization stats
+    # load normalization stats (only if NOT filtering warmup - otherwise compute from filtered data)
     stats_path = os.path.join(os.path.dirname(data_path), "normalization_stats.npz")
-    if os.path.exists(stats_path):
+    if min_episode_step == 0 and os.path.exists(stats_path):
         stats = dict(np.load(stats_path))
         print(f"      Loaded normalization statistics from {stats_path}")
     else:
         stats = None
-        print("      Computing normalization statistics from data")
+        if min_episode_step > 0:
+            print(f"      Will compute normalization stats from filtered data (warmup excluded)")
+        else:
+            print("      Computing normalization statistics from data")
 
     # create dataset
     print(f"\n[2/5] Creating dataset splits (train/val/test: "
           f"{100*(1-val_split-test_split):.0f}/{100*val_split:.0f}/{100*test_split:.0f}%)")
     
-    dataset = TransitionDataset(obs, actions, next_obs, dones, normalize=True, stats=stats)
+    dataset = TransitionDataset(obs, actions, next_obs, dones, normalize=True, stats=stats,
+                                  episode_steps=episode_steps, min_episode_step=min_episode_step)
     
     # train/val/test split
     total_size = len(dataset)
@@ -703,6 +733,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--early_stopping", type=int, default=20, 
                         help="Early stopping patience (epochs)")
+    parser.add_argument("--min_episode_step", type=int, default=0,
+                        help="Minimum episode step to include (filter warmup/standup, e.g. 50)")
 
     args = parser.parse_args()
 
@@ -721,6 +753,7 @@ def main():
         device=args.device,
         seed=args.seed,
         early_stopping_patience=args.early_stopping,
+        min_episode_step=args.min_episode_step,
     )
 
 
